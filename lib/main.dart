@@ -83,7 +83,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       setState(() {
-        _statusMessage = 'Location service is disabled';
+        _statusMessage = '定位服务未开启，请在系统设置中打开';
         _isTracking = false;
       });
       return;
@@ -97,7 +97,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
       setState(() {
-        _statusMessage = 'Location permission denied';
+        _statusMessage = '定位权限被拒绝，请在设置中允许访问位置';
         _isTracking = false;
       });
       return;
@@ -113,16 +113,18 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
         Geolocator.getPositionStream(locationSettings: settings).listen(
           _onPosition,
           onError: (Object error) {
-            setState(() {
-              _statusMessage = 'Location stream error: $error';
-              _isTracking = false;
-            });
             _stopwatch.stop();
             _stopTicker();
-            _speedMps = 0;
-            _lastTrackedPosition = null;
             _positionSubscription?.cancel();
             _positionSubscription = null;
+            setState(() {
+              _statusMessage = '定位数据流错误: $error';
+              _isTracking = false;
+              _speedMps = 0;
+              _lastTimestamp = null;
+              _lastPosition = null;
+              _lastTrackedPosition = null;
+            });
           },
         );
 
