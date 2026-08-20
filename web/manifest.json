@@ -1,6 +1,6 @@
 {
-    "name": "simplespeedometer",
-    "short_name": "simplespeedometer",
+    "name": "SimpleSpeedometer",
+    "short_name": "SimpleSpeedometer",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",

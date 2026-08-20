@@ -15,7 +15,7 @@ class SpeedometerApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'Simple Speedometer',
+      title: 'SimpleSpeedometer',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
         useMaterial3: true,
@@ -271,7 +271,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
     final colorScheme = Theme.of(context).colorScheme;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Simple Speedometer')),
+      appBar: AppBar(title: const Text('SimpleSpeedometer')),
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {
