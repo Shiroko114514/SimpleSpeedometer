@@ -23,17 +23,41 @@ jobs:
           flutter-version: '3.41.3'
           cache: true
 
+      - name: Decode signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: echo "$KEYSTORE_BASE64" | base64 --decode > android/app/upload-keystore.jks
+
+      - name: Create key.properties
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          cat > android/key.properties <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=upload
+          storeFile=app/upload-keystore.jks
+          EOF
+
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Build release APK
+      - name: Build universal release APK
         run: flutter build apk --release
 
-      - name: Publish release and upload APK
+      - name: Build split-per-abi APKs
+        run: flutter build apk --release --split-per-abi
+
+      - name: Publish release and upload APKs
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}
-          files: build/app/outputs/flutter-apk/app-release.apk
+          files: |
+            build/app/outputs/flutter-apk/app-release.apk
+            build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+            build/app/outputs/flutter-apk/app-x86_64-release.apk
           generate_release_notes: true
           prerelease: ${{ github.ref_type != 'tag' }}
         env:
