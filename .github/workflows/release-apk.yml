@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag，例如 v1.0.0'
+        required: true
+        default: 'v1.0.0'
 
 permissions:
   contents: write
@@ -52,7 +57,7 @@ jobs:
       - name: Publish release and upload APKs
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', github.run_number) }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || inputs.release_tag }}
           files: |
             build/app/outputs/flutter-apk/app-release.apk
             build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
