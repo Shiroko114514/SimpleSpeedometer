@@ -1,3 +1,3 @@
 # SimpleSpeedometer
 
-一使用flutter编写的支持多平台的简易速度计
+一个使用flutter编写的支持多平台的简易速度计
