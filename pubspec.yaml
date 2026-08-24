@@ -40,6 +40,9 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
+  # 用于在测试中 mock 定位平台，验证定位持续刷新逻辑
+  geolocator_platform_interface: ^4.2.8
+
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your

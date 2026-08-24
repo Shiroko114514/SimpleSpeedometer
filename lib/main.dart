@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 
@@ -33,18 +34,22 @@ class SpeedometerPage extends StatefulWidget {
 }
 
 class _SpeedometerPageState extends State<SpeedometerPage> {
-  static const double _maxSpeedKmh = 180;
+  static const double _maxSpeedKmh = 400;
 
   StreamSubscription<Position>? _positionSubscription;
   Timer? _ticker;
+  Timer? _watchdog;
   final Stopwatch _stopwatch = Stopwatch();
 
   Position? _lastPosition;
   Position? _lastTrackedPosition;
   DateTime? _lastTimestamp;
+  DateTime? _lastPositionUpdate;
+  bool _isFetchingPosition = false;
 
   String _statusMessage = '点击“开始测速”开始';
   bool _isTracking = false;
+  bool _hasSession = false;
   double _speedMps = 0;
   double _distanceMeters = 0;
 
@@ -56,6 +61,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
   @override
   void dispose() {
     _ticker?.cancel();
+    _watchdog?.cancel();
     _positionSubscription?.cancel();
     super.dispose();
   }
@@ -73,6 +79,65 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
   void _stopTicker() {
     _ticker?.cancel();
     _ticker = null;
+  }
+
+  LocationSettings get _locationSettings {
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      return AndroidSettings(
+        accuracy: LocationAccuracy.bestForNavigation,
+        distanceFilter: 0,
+        intervalDuration: const Duration(seconds: 1),
+      );
+    }
+    return LocationSettings(
+      accuracy: LocationAccuracy.bestForNavigation,
+      distanceFilter: 0,
+    );
+  }
+
+  /// 当定位流超过 3 秒没有产生新数据时，主动拉取一次当前位置，
+  /// 避免部分设备上定位流只上报一次就不再更新的问题。
+  void _startWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = Timer.periodic(const Duration(seconds: 1), (_) async {
+      if (!mounted || !_isTracking) {
+        return;
+      }
+      final lastUpdate = _lastPositionUpdate;
+      if (lastUpdate != null &&
+          DateTime.now().difference(lastUpdate) <
+              const Duration(seconds: 3)) {
+        return;
+      }
+      await _fetchCurrentPosition();
+    });
+  }
+
+  void _stopWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = null;
+  }
+
+  Future<void> _fetchCurrentPosition() async {
+    if (_isFetchingPosition || !_isTracking) {
+      return;
+    }
+    _isFetchingPosition = true;
+    try {
+      final position = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.bestForNavigation,
+          timeLimit: Duration(seconds: 3),
+        ),
+      );
+      if (mounted && _isTracking) {
+        _onPosition(position);
+      }
+    } catch (_) {
+      // 获取失败（如超时），由后续轮询自动重试
+    } finally {
+      _isFetchingPosition = false;
+    }
   }
 
   Future<void> _startTracking() async {
@@ -103,37 +168,36 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
       return;
     }
 
-    const settings = LocationSettings(
-      accuracy: LocationAccuracy.bestForNavigation,
-      distanceFilter: 1,
-    );
-
     _positionSubscription?.cancel();
     _positionSubscription =
-        Geolocator.getPositionStream(locationSettings: settings).listen(
-          _onPosition,
-          onError: (Object error) {
-            _stopwatch.stop();
-            _stopTicker();
-            _positionSubscription?.cancel();
-            _positionSubscription = null;
-            setState(() {
-              _statusMessage = '定位数据流错误: $error';
-              _isTracking = false;
-              _speedMps = 0;
-              _lastTimestamp = null;
-              _lastPosition = null;
-              _lastTrackedPosition = null;
-            });
-          },
-        );
+        Geolocator.getPositionStream(locationSettings: _locationSettings)
+            .listen(
+              _onPosition,
+              onError: (Object error) {
+                _stopwatch.stop();
+                _stopTicker();
+                _stopWatchdog();
+                _positionSubscription?.cancel();
+                _positionSubscription = null;
+                setState(() {
+                  _statusMessage = '定位数据流错误: $error';
+                  _isTracking = false;
+                  _speedMps = 0;
+                  _lastTimestamp = null;
+                  _lastPosition = null;
+                  _lastTrackedPosition = null;
+                });
+              },
+            );
 
     _stopwatch.start();
     _startTicker();
+    _startWatchdog();
 
     setState(() {
       _statusMessage = '测速中...';
       _isTracking = true;
+      _hasSession = true;
     });
   }
 
@@ -143,6 +207,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
 
     _stopwatch.stop();
     _stopTicker();
+    _stopWatchdog();
 
     setState(() {
       _isTracking = false;
@@ -161,9 +226,11 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
       ..stop()
       ..reset();
     _stopTicker();
+    _stopWatchdog();
 
     setState(() {
       _isTracking = false;
+      _hasSession = false;
       _speedMps = 0;
       _distanceMeters = 0;
       _lastTimestamp = null;
@@ -174,6 +241,8 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
   }
 
   void _onPosition(Position position) {
+    _lastPositionUpdate = DateTime.now();
+
     if (_isTracking) {
       final trackedPrev = _lastTrackedPosition;
       if (trackedPrev != null) {
@@ -233,8 +302,6 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
     return (_distanceMeters / seconds) * 3.6;
   }
 
-  bool get _hasSessionData => _distanceMeters > 0 || _elapsed.inSeconds > 0;
-
   String _formatDuration(Duration duration) {
     final hours = duration.inHours.toString().padLeft(2, '0');
     final minutes = (duration.inMinutes % 60).toString().padLeft(2, '0');
@@ -278,41 +345,59 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
         child: LayoutBuilder(
           builder: (context, constraints) {
             final contentWidth = math.min(constraints.maxWidth, 420.0);
+            final viewportHeight = constraints.maxHeight;
+
+            // 表盘以外全部内容（速度数值/标签/统计/状态/坐标/按钮及间距）的
+            // 估算高度，用于在矮屏上压缩表盘高度，优先保证按钮一屏可见。
+            const double fixedContentHeight = 330.0;
+            const double gaugeBlockMinHeight = 200.0;
+            final gaugeBlockHeight = math.max(
+              gaugeBlockMinHeight,
+              viewportHeight - fixedContentHeight,
+            );
 
             return SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(vertical: 28),
               child: Center(
                 child: ConstrainedBox(
                   constraints: BoxConstraints(
                     maxWidth: contentWidth,
-                    minHeight: math.max(0, constraints.maxHeight - 56),
+                    minHeight: math.max(0, viewportHeight - 24),
                   ),
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 20),
+                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        const SizedBox(height: 20),
-                        SpeedGauge(
-                          speedKmh: speedKmh,
-                          maxSpeedKmh: _maxSpeedKmh,
+                        SizedBox(
+                          height: gaugeBlockHeight,
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Expanded(
+                                child: SpeedGauge(
+                                  speedKmh: speedKmh,
+                                  maxSpeedKmh: _maxSpeedKmh,
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Text(
+                                speedKmh.toStringAsFixed(1),
+                                style: Theme.of(context).textTheme.displayMedium
+                                    ?.copyWith(fontWeight: FontWeight.w700),
+                              ),
+                              Text(
+                                '实时速度 (km/h)',
+                                style: Theme.of(context).textTheme.titleMedium,
+                              ),
+                            ],
+                          ),
                         ),
                         const SizedBox(height: 10),
-                        Text(
-                          speedKmh.toStringAsFixed(1),
-                          style: Theme.of(context).textTheme.displayMedium
-                              ?.copyWith(fontWeight: FontWeight.w700),
-                        ),
-                        Text(
-                          '实时速度 (km/h)',
-                          style: Theme.of(context).textTheme.titleMedium,
-                        ),
-                        const SizedBox(height: 28),
                         Container(
                           width: double.infinity,
                           padding: const EdgeInsets.symmetric(
                             horizontal: 16,
-                            vertical: 14,
+                            vertical: 12,
                           ),
                           decoration: BoxDecoration(
                             color: colorScheme.surfaceContainerLow,
@@ -338,12 +423,12 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
                             ],
                           ),
                         ),
-                        const SizedBox(height: 14),
+                        const SizedBox(height: 8),
                         Container(
                           width: double.infinity,
                           padding: const EdgeInsets.symmetric(
                             horizontal: 16,
-                            vertical: 16,
+                            vertical: 10,
                           ),
                           decoration: BoxDecoration(
                             color: colorScheme.surfaceContainerLow,
@@ -355,12 +440,12 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
                             style: Theme.of(context).textTheme.bodyLarge,
                           ),
                         ),
-                        const SizedBox(height: 14),
+                        const SizedBox(height: 8),
                         Container(
                           width: double.infinity,
                           padding: const EdgeInsets.symmetric(
                             horizontal: 16,
-                            vertical: 16,
+                            vertical: 10,
                           ),
                           decoration: BoxDecoration(
                             color: colorScheme.surfaceContainerLow,
@@ -373,7 +458,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
                             style: Theme.of(context).textTheme.bodyMedium,
                           ),
                         ),
-                        const SizedBox(height: 44),
+                        const SizedBox(height: 12),
                         if (_isTracking)
                           Row(
                             children: [
@@ -404,7 +489,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
                               ),
                             ],
                           )
-                        else if (_hasSessionData)
+                        else if (_hasSession)
                           Row(
                             children: [
                               Expanded(
@@ -448,7 +533,7 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
                               label: const Text('开始测速'),
                             ),
                           ),
-                        const SizedBox(height: 20),
+                        const SizedBox(height: 8),
                       ],
                     ),
                   ),
@@ -476,25 +561,39 @@ class SpeedGauge extends StatelessWidget {
   Widget build(BuildContext context) {
     final clampedSpeed = speedKmh.clamp(0.0, maxSpeedKmh);
 
-    return TweenAnimationBuilder<double>(
-      tween: Tween<double>(begin: 0, end: clampedSpeed),
-      duration: const Duration(milliseconds: 450),
-      curve: Curves.easeOutCubic,
-      builder: (context, animatedSpeed, _) {
-        const gaugeSize = Size(340, 260);
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        // 在可用空间内等比缩放表盘，最大为 340x260，避免矮屏上被截断
+        final scale = math.min(
+          1.0,
+          math.min(
+            constraints.maxWidth / 340.0,
+            constraints.maxHeight / 260.0,
+          ),
+        );
+        final gaugeSize = Size(340 * scale, 260 * scale);
 
-        return SizedBox(
-          width: gaugeSize.width,
-          height: gaugeSize.height,
-          child: ClipRect(
-            child: CustomPaint(
-              size: gaugeSize,
-              painter: _SpeedGaugePainter(
-                speedKmh: animatedSpeed,
-                maxSpeedKmh: maxSpeedKmh,
-                colorScheme: Theme.of(context).colorScheme,
-              ),
-            ),
+        return Center(
+          child: TweenAnimationBuilder<double>(
+            tween: Tween<double>(begin: 0, end: clampedSpeed),
+            duration: const Duration(milliseconds: 450),
+            curve: Curves.easeOutCubic,
+            builder: (context, animatedSpeed, _) {
+              return SizedBox(
+                width: gaugeSize.width,
+                height: gaugeSize.height,
+                child: ClipRect(
+                  child: CustomPaint(
+                    size: gaugeSize,
+                    painter: _SpeedGaugePainter(
+                      speedKmh: animatedSpeed,
+                      maxSpeedKmh: maxSpeedKmh,
+                      colorScheme: Theme.of(context).colorScheme,
+                    ),
+                  ),
+                ),
+              );
+            },
           ),
         );
       },
@@ -516,13 +615,28 @@ class _SpeedGaugePainter extends CustomPainter {
   static const double _startAngle = math.pi * 0.75;
   static const double _sweepAngle = math.pi * 1.5;
 
+  // 非线性刻度：0-160 km/h 展开（占 72% 的弧长），160-400 km/h 压缩（占 28%）
+  static const double _breakpointKmh = 160;
+  static const double _breakpointFraction = 0.72;
+
+  /// 把速度 km/h 映射到表盘的弧长比例 [0, 1]
+  double _speedToFraction(double kmh) {
+    final s = kmh.clamp(0.0, maxSpeedKmh);
+    if (s <= _breakpointKmh) {
+      return (s / _breakpointKmh) * _breakpointFraction;
+    }
+    return _breakpointFraction +
+        ((s - _breakpointKmh) / (maxSpeedKmh - _breakpointKmh)) *
+            (1 - _breakpointFraction);
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height * 0.58);
     final radius = math.min(size.width / 2 - 20, size.height * 0.46);
 
     final arcRect = Rect.fromCircle(center: center, radius: radius);
-    final value = (speedKmh / maxSpeedKmh).clamp(0.0, 1.0);
+    final value = _speedToFraction(speedKmh);
     final needleAngle = _startAngle + _sweepAngle * value;
 
     final baseArcPaint = Paint()
@@ -565,11 +679,15 @@ class _SpeedGaugePainter extends CustomPainter {
       ..strokeWidth = 1.4
       ..strokeCap = StrokeCap.round;
 
-    const int majorTicks = 9;
-    const int minorBetween = 4;
+    // 主刻度：0-160 每 20 km/h（展开、刻度更细），160-400 稀疏（200/250/300/350/400）
+    const List<double> majorTickSpeeds = [
+      0, 20, 40, 60, 80, 100, 120, 140, 160, 200, 250, 300, 350, 400,
+    ];
+    // 次刻度：仅在 0-160 内，每 10 km/h（主刻度之间各一条）
+    const List<double> minorTickSpeeds = [10, 30, 50, 70, 90, 110, 130, 150];
 
-    for (int i = 0; i <= majorTicks; i++) {
-      final t = i / majorTicks;
+    for (final tickSpeed in majorTickSpeeds) {
+      final t = _speedToFraction(tickSpeed);
       final angle = _startAngle + _sweepAngle * t;
       final isActiveTick = t <= value;
 
@@ -581,11 +699,10 @@ class _SpeedGaugePainter extends CustomPainter {
         isActiveTick ? majorTickActivePaint : majorTickPaint,
       );
 
-      final labelSpeed = (maxSpeedKmh * t).round();
       final labelOffset = _pointOnCircle(center, radius - 34, angle);
       _drawCenteredText(
         canvas,
-        labelSpeed.toString(),
+        tickSpeed.round().toString(),
         labelOffset,
         TextStyle(
           color: colorScheme.onSurface.withValues(alpha: 0.8),
@@ -593,18 +710,14 @@ class _SpeedGaugePainter extends CustomPainter {
           fontWeight: FontWeight.w600,
         ),
       );
+    }
 
-      if (i == majorTicks) {
-        continue;
-      }
-
-      for (int j = 1; j <= minorBetween; j++) {
-        final subT = (i + j / (minorBetween + 1)) / majorTicks;
-        final subAngle = _startAngle + _sweepAngle * subT;
-        final subOuter = _pointOnCircle(center, radius + 1, subAngle);
-        final subInner = _pointOnCircle(center, radius - 9, subAngle);
-        canvas.drawLine(subOuter, subInner, minorTickPaint);
-      }
+    for (final tickSpeed in minorTickSpeeds) {
+      final t = _speedToFraction(tickSpeed);
+      final angle = _startAngle + _sweepAngle * t;
+      final subOuter = _pointOnCircle(center, radius + 1, angle);
+      final subInner = _pointOnCircle(center, radius - 9, angle);
+      canvas.drawLine(subOuter, subInner, minorTickPaint);
     }
 
     final needleTail = _pointOnCircle(
