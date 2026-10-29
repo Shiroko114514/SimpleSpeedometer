@@ -1,0 +1,771 @@
+   1| import 'dart:async';
+   2| import 'dart:math' as math;
+   3| 
+   4| import 'package:flutter/foundation.dart';
+   5| import 'package:flutter/material.dart';
+   6| import 'package:geolocator/geolocator.dart';
+   7| 
+   8| void main() {
+   9|   runApp(const SpeedometerApp());
+  10| }
+  11| 
+  12| class SpeedometerApp extends StatelessWidget {
+  13|   const SpeedometerApp({super.key});
+  14| 
+  15|   @override
+  16|   Widget build(BuildContext context) {
+  17|     return MaterialApp(
+  18|       debugShowCheckedModeBanner: false,
+  19|       title: 'SimpleSpeedometer',
+  20|       theme: ThemeData(
+  21|         colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
+  22|         useMaterial3: true,
+  23|       ),
+  24|       home: const SpeedometerPage(),
+  25|     );
+  26|   }
+  27| }
+  28| 
+  29| class SpeedometerPage extends StatefulWidget {
+  30|   const SpeedometerPage({super.key});
+  31| 
+  32|   @override
+  33|   State<SpeedometerPage> createState() => _SpeedometerPageState();
+  34| }
+  35| 
+  36| class _SpeedometerPageState extends State<SpeedometerPage> {
+  37|   static const double _maxSpeedKmh = 400;
+  38| 
+  39|   StreamSubscription<Position>? _positionSubscription;
+  40|   Timer? _ticker;
+  41|   Timer? _watchdog;
+  42|   final Stopwatch _stopwatch = Stopwatch();
+  43| 
+  44|   Position? _lastPosition;
+  45|   Position? _lastTrackedPosition;
+  46|   DateTime? _lastTimestamp;
+  47|   DateTime? _lastPositionUpdate;
+  48|   bool _isFetchingPosition = false;
+  49| 
+  50|   String _statusMessage = '点击“开始测速”开始';
+  51|   bool _isTracking = false;
+  52|   bool _hasSession = false;
+  53|   double _speedMps = 0;
+  54|   double _distanceMeters = 0;
+  55| 
+  56|   @override
+  57|   void initState() {
+  58|     super.initState();
+  59|   }
+  60| 
+  61|   @override
+  62|   void dispose() {
+  63|     _ticker?.cancel();
+  64|     _watchdog?.cancel();
+  65|     _positionSubscription?.cancel();
+  66|     super.dispose();
+  67|   }
+  68| 
+  69|   void _startTicker() {
+  70|     _ticker?.cancel();
+  71|     _ticker = Timer.periodic(const Duration(seconds: 1), (_) {
+  72|       if (!mounted || !_isTracking) {
+  73|         return;
+  74|       }
+  75|       setState(() {});
+  76|     });
+  77|   }
+  78| 
+  79|   void _stopTicker() {
+  80|     _ticker?.cancel();
+  81|     _ticker = null;
+  82|   }
+  83| 
+  84|   LocationSettings get _locationSettings {
+  85|     if (defaultTargetPlatform == TargetPlatform.android) {
+  86|       return AndroidSettings(
+  87|         accuracy: LocationAccuracy.bestForNavigation,
+  88|         distanceFilter: 0,
+  89|         intervalDuration: const Duration(seconds: 1),
+  90|       );
+  91|     }
+  92|     return LocationSettings(
+  93|       accuracy: LocationAccuracy.bestForNavigation,
+  94|       distanceFilter: 0,
+  95|     );
+  96|   }
+  97| 
+  98|   /// 当定位流超过 3 秒没有产生新数据时，主动拉取一次当前位置，
+  99|   /// 避免部分设备上定位流只上报一次就不再更新的问题。
+ 100|   void _startWatchdog() {
+ 101|     _watchdog?.cancel();
+ 102|     _watchdog = Timer.periodic(const Duration(seconds: 1), (_) async {
+ 103|       if (!mounted || !_isTracking) {
+ 104|         return;
+ 105|       }
+ 106|       final lastUpdate = _lastPositionUpdate;
+ 107|       if (lastUpdate != null &&
+ 108|           DateTime.now().difference(lastUpdate) <
+ 109|               const Duration(seconds: 3)) {
+ 110|         return;
+ 111|       }
+ 112|       await _fetchCurrentPosition();
+ 113|     });
+ 114|   }
+ 115| 
+ 116|   void _stopWatchdog() {
+ 117|     _watchdog?.cancel();
+ 118|     _watchdog = null;
+ 119|   }
+ 120| 
+ 121|   Future<void> _fetchCurrentPosition() async {
+ 122|     if (_isFetchingPosition || !_isTracking) {
+ 123|       return;
+ 124|     }
+ 125|     _isFetchingPosition = true;
+ 126|     try {
+ 127|       final position = await Geolocator.getCurrentPosition(
+ 128|         locationSettings: const LocationSettings(
+ 129|           accuracy: LocationAccuracy.bestForNavigation,
+ 130|           timeLimit: Duration(seconds: 3),
+ 131|         ),
+ 132|       );
+ 133|       if (mounted && _isTracking) {
+ 134|         _onPosition(position);
+ 135|       }
+ 136|     } catch (_) {
+ 137|       // 获取失败（如超时），由后续轮询自动重试
+ 138|     } finally {
+ 139|       _isFetchingPosition = false;
+ 140|     }
+ 141|   }
+ 142| 
+ 143|   Future<void> _startTracking() async {
+ 144|     if (_isTracking) {
+ 145|       return;
+ 146|     }
+ 147| 
+ 148|     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+ 149|     if (!serviceEnabled) {
+ 150|       setState(() {
+ 151|         _statusMessage = '定位服务未开启，请在系统设置中打开';
+ 152|         _isTracking = false;
+ 153|       });
+ 154|       return;
+ 155|     }
+ 156| 
+ 157|     var permission = await Geolocator.checkPermission();
+ 158|     if (permission == LocationPermission.denied) {
+ 159|       permission = await Geolocator.requestPermission();
+ 160|     }
+ 161| 
+ 162|     if (permission == LocationPermission.denied ||
+ 163|         permission == LocationPermission.deniedForever) {
+ 164|       setState(() {
+ 165|         _statusMessage = '定位权限被拒绝，请在设置中允许访问位置';
+ 166|         _isTracking = false;
+ 167|       });
+ 168|       return;
+ 169|     }
+ 170| 
+ 171|     _positionSubscription?.cancel();
+ 172|     _positionSubscription =
+ 173|         Geolocator.getPositionStream(locationSettings: _locationSettings)
+ 174|             .listen(
+ 175|               _onPosition,
+ 176|               onError: (Object error) {
+ 177|                 _stopwatch.stop();
+ 178|                 _stopTicker();
+ 179|                 _stopWatchdog();
+ 180|                 _positionSubscription?.cancel();
+ 181|                 _positionSubscription = null;
+ 182|                 setState(() {
+ 183|                   _statusMessage = '定位数据流错误: $error';
+ 184|                   _isTracking = false;
+ 185|                   _speedMps = 0;
+ 186|                   _lastTimestamp = null;
+ 187|                   _lastPosition = null;
+ 188|                   _lastTrackedPosition = null;
+ 189|                 });
+ 190|               },
+ 191|             );
+ 192| 
+ 193|     _stopwatch.start();
+ 194|     _startTicker();
+ 195|     _startWatchdog();
+ 196| 
+ 197|     setState(() {
+ 198|       _statusMessage = '测速中...';
+ 199|       _isTracking = true;
+ 200|       _hasSession = true;
+ 201|     });
+ 202|   }
+ 203| 
+ 204|   Future<void> _pauseTracking() async {
+ 205|     await _positionSubscription?.cancel();
+ 206|     _positionSubscription = null;
+ 207| 
+ 208|     _stopwatch.stop();
+ 209|     _stopTicker();
+ 210|     _stopWatchdog();
+ 211| 
+ 212|     setState(() {
+ 213|       _isTracking = false;
+ 214|       _speedMps = 0;
+ 215|       _lastTimestamp = null;
+ 216|       _lastTrackedPosition = null;
+ 217|       _statusMessage = '测速已暂停';
+ 218|     });
+ 219|   }
+ 220| 
+ 221|   Future<void> _endTracking() async {
+ 222|     await _positionSubscription?.cancel();
+ 223|     _positionSubscription = null;
+ 224| 
+ 225|     _stopwatch
+ 226|       ..stop()
+ 227|       ..reset();
+ 228|     _stopTicker();
+ 229|     _stopWatchdog();
+ 230| 
+ 231|     setState(() {
+ 232|       _isTracking = false;
+ 233|       _hasSession = false;
+ 234|       _speedMps = 0;
+ 235|       _distanceMeters = 0;
+ 236|       _lastTimestamp = null;
+ 237|       _lastPosition = null;
+ 238|       _lastTrackedPosition = null;
+ 239|       _statusMessage = '点击“开始测速”开始';
+ 240|     });
+ 241|   }
+ 242| 
+ 243|   void _onPosition(Position position) {
+ 244|     _lastPositionUpdate = DateTime.now();
+ 245| 
+ 246|     if (_isTracking) {
+ 247|       final trackedPrev = _lastTrackedPosition;
+ 248|       if (trackedPrev != null) {
+ 249|         _distanceMeters += Geolocator.distanceBetween(
+ 250|           trackedPrev.latitude,
+ 251|           trackedPrev.longitude,
+ 252|           position.latitude,
+ 253|           position.longitude,
+ 254|         );
+ 255|       }
+ 256|       _lastTrackedPosition = position;
+ 257|     }
+ 258| 
+ 259|     double speedMps = position.speed;
+ 260| 
+ 261|     if (speedMps.isNaN || speedMps.isNegative || speedMps == 0) {
+ 262|       final prev = _lastPosition;
+ 263|       final prevTime = _lastTimestamp;
+ 264|       if (prev != null && prevTime != null) {
+ 265|         final now = DateTime.now();
+ 266|         final dt = now.difference(prevTime).inMilliseconds / 1000;
+ 267|         if (dt > 0) {
+ 268|           final distance = Geolocator.distanceBetween(
+ 269|             prev.latitude,
+ 270|             prev.longitude,
+ 271|             position.latitude,
+ 272|             position.longitude,
+ 273|           );
+ 274|           speedMps = distance / dt;
+ 275|         }
+ 276|         _lastTimestamp = now;
+ 277|       } else {
+ 278|         _lastTimestamp = DateTime.now();
+ 279|       }
+ 280|     } else {
+ 281|       _lastTimestamp = DateTime.now();
+ 282|     }
+ 283| 
+ 284|     _lastPosition = position;
+ 285| 
+ 286|     setState(() {
+ 287|       _speedMps = speedMps.clamp(0, 999);
+ 288|       _statusMessage = '测速中...';
+ 289|       _isTracking = true;
+ 290|     });
+ 291|   }
+ 292| 
+ 293|   double get _speedKmh => _speedMps * 3.6;
+ 294| 
+ 295|   Duration get _elapsed => _stopwatch.elapsed;
+ 296| 
+ 297|   double get _averageSpeedKmh {
+ 298|     final seconds = _elapsed.inMilliseconds / 1000;
+ 299|     if (seconds <= 0) {
+ 300|       return 0;
+ 301|     }
+ 302|     return (_distanceMeters / seconds) * 3.6;
+ 303|   }
+ 304| 
+ 305|   String _formatDuration(Duration duration) {
+ 306|     final hours = duration.inHours.toString().padLeft(2, '0');
+ 307|     final minutes = (duration.inMinutes % 60).toString().padLeft(2, '0');
+ 308|     final seconds = (duration.inSeconds % 60).toString().padLeft(2, '0');
+ 309|     return '$hours:$minutes:$seconds';
+ 310|   }
+ 311| 
+ 312|   String _formatDistance(double meters) {
+ 313|     if (meters >= 1000) {
+ 314|       return '${(meters / 1000).toStringAsFixed(2)} km';
+ 315|     }
+ 316|     return '${meters.toStringAsFixed(0)} m';
+ 317|   }
+ 318| 
+ 319|   Widget _metricRow(BuildContext context, String label, String value) {
+ 320|     return Padding(
+ 321|       padding: const EdgeInsets.symmetric(vertical: 4),
+ 322|       child: Row(
+ 323|         children: [
+ 324|           Text(label, style: Theme.of(context).textTheme.bodyMedium),
+ 325|           const Spacer(),
+ 326|           Text(
+ 327|             value,
+ 328|             style: Theme.of(
+ 329|               context,
+ 330|             ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+ 331|           ),
+ 332|         ],
+ 333|       ),
+ 334|     );
+ 335|   }
+ 336| 
+ 337|   @override
+ 338|   Widget build(BuildContext context) {
+ 339|     final speedKmh = _speedKmh;
+ 340|     final colorScheme = Theme.of(context).colorScheme;
+ 341| 
+ 342|     return Scaffold(
+ 343|       appBar: AppBar(title: const Text('SimpleSpeedometer')),
+ 344|       body: SafeArea(
+ 345|         child: LayoutBuilder(
+ 346|           builder: (context, constraints) {
+ 347|             final contentWidth = math.min(constraints.maxWidth, 420.0);
+ 348|             final viewportHeight = constraints.maxHeight;
+ 349| 
+ 350|             // 表盘以外全部内容（速度数值/标签/统计/状态/坐标/按钮及间距）的
+ 351|             // 估算高度，用于在矮屏上压缩表盘高度，优先保证按钮一屏可见。
+ 352|             const double fixedContentHeight = 330.0;
+ 353|             const double gaugeBlockMinHeight = 200.0;
+ 354|             final gaugeBlockHeight = math.max(
+ 355|               gaugeBlockMinHeight,
+ 356|               viewportHeight - fixedContentHeight,
+ 357|             );
+ 358| 
+ 359|             return SingleChildScrollView(
+ 360|               child: Center(
+ 361|                 child: ConstrainedBox(
+ 362|                   constraints: BoxConstraints(
+ 363|                     maxWidth: contentWidth,
+ 364|                     minHeight: math.max(0, viewportHeight - 24),
+ 365|                   ),
+ 366|                   child: Padding(
+ 367|                     padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+ 368|                     child: Column(
+ 369|                       mainAxisAlignment: MainAxisAlignment.center,
+ 370|                       children: [
+ 371|                         SizedBox(
+ 372|                           height: gaugeBlockHeight,
+ 373|                           child: Column(
+ 374|                             mainAxisAlignment: MainAxisAlignment.center,
+ 375|                             children: [
+ 376|                               Expanded(
+ 377|                                 child: SpeedGauge(
+ 378|                                   speedKmh: speedKmh,
+ 379|                                   maxSpeedKmh: _maxSpeedKmh,
+ 380|                                 ),
+ 381|                               ),
+ 382|                               const SizedBox(height: 6),
+ 383|                               Text(
+ 384|                                 speedKmh.toStringAsFixed(1),
+ 385|                                 style: Theme.of(context).textTheme.displayMedium
+ 386|                                     ?.copyWith(fontWeight: FontWeight.w700),
+ 387|                               ),
+ 388|                               Text(
+ 389|                                 '实时速度 (km/h)',
+ 390|                                 style: Theme.of(context).textTheme.titleMedium,
+ 391|                               ),
+ 392|                             ],
+ 393|                           ),
+ 394|                         ),
+ 395|                         const SizedBox(height: 10),
+ 396|                         Container(
+ 397|                           width: double.infinity,
+ 398|                           padding: const EdgeInsets.symmetric(
+ 399|                             horizontal: 16,
+ 400|                             vertical: 12,
+ 401|                           ),
+ 402|                           decoration: BoxDecoration(
+ 403|                             color: colorScheme.surfaceContainerLow,
+ 404|                             borderRadius: BorderRadius.circular(14),
+ 405|                           ),
+ 406|                           child: Column(
+ 407|                             children: [
+ 408|                               _metricRow(
+ 409|                                 context,
+ 410|                                 '时间',
+ 411|                                 _formatDuration(_elapsed),
+ 412|                               ),
+ 413|                               _metricRow(
+ 414|                                 context,
+ 415|                                 '距离',
+ 416|                                 _formatDistance(_distanceMeters),
+ 417|                               ),
+ 418|                               _metricRow(
+ 419|                                 context,
+ 420|                                 '平均速度',
+ 421|                                 '${_averageSpeedKmh.toStringAsFixed(1)} km/h',
+ 422|                               ),
+ 423|                             ],
+ 424|                           ),
+ 425|                         ),
+ 426|                         const SizedBox(height: 8),
+ 427|                         Container(
+ 428|                           width: double.infinity,
+ 429|                           padding: const EdgeInsets.symmetric(
+ 430|                             horizontal: 16,
+ 431|                             vertical: 10,
+ 432|                           ),
+ 433|                           decoration: BoxDecoration(
+ 434|                             color: colorScheme.surfaceContainerLow,
+ 435|                             borderRadius: BorderRadius.circular(14),
+ 436|                           ),
+ 437|                           child: Text(
+ 438|                             _statusMessage,
+ 439|                             textAlign: TextAlign.center,
+ 440|                             style: Theme.of(context).textTheme.bodyLarge,
+ 441|                           ),
+ 442|                         ),
+ 443|                         const SizedBox(height: 8),
+ 444|                         Container(
+ 445|                           width: double.infinity,
+ 446|                           padding: const EdgeInsets.symmetric(
+ 447|                             horizontal: 16,
+ 448|                             vertical: 10,
+ 449|                           ),
+ 450|                           decoration: BoxDecoration(
+ 451|                             color: colorScheme.surfaceContainerLow,
+ 452|                             borderRadius: BorderRadius.circular(14),
+ 453|                           ),
+ 454|                           child: Text(
+ 455|                             'Lat: ${_lastPosition?.latitude.toStringAsFixed(6) ?? '-'}  '
+ 456|                             'Lng: ${_lastPosition?.longitude.toStringAsFixed(6) ?? '-'}',
+ 457|                             textAlign: TextAlign.center,
+ 458|                             style: Theme.of(context).textTheme.bodyMedium,
+ 459|                           ),
+ 460|                         ),
+ 461|                         const SizedBox(height: 12),
+ 462|                         if (_isTracking)
+ 463|                           Row(
+ 464|                             children: [
+ 465|                               Expanded(
+ 466|                                 child: OutlinedButton.icon(
+ 467|                                   style: OutlinedButton.styleFrom(
+ 468|                                     padding: const EdgeInsets.symmetric(
+ 469|                                       vertical: 16,
+ 470|                                     ),
+ 471|                                   ),
+ 472|                                   onPressed: _pauseTracking,
+ 473|                                   icon: const Icon(Icons.pause_circle),
+ 474|                                   label: const Text('暂停测速'),
+ 475|                                 ),
+ 476|                               ),
+ 477|                               const SizedBox(width: 12),
+ 478|                               Expanded(
+ 479|                                 child: FilledButton.icon(
+ 480|                                   style: FilledButton.styleFrom(
+ 481|                                     padding: const EdgeInsets.symmetric(
+ 482|                                       vertical: 16,
+ 483|                                     ),
+ 484|                                   ),
+ 485|                                   onPressed: _endTracking,
+ 486|                                   icon: const Icon(Icons.stop_circle),
+ 487|                                   label: const Text('结束测速'),
+ 488|                                 ),
+ 489|                               ),
+ 490|                             ],
+ 491|                           )
+ 492|                         else if (_hasSession)
+ 493|                           Row(
+ 494|                             children: [
+ 495|                               Expanded(
+ 496|                                 child: FilledButton.icon(
+ 497|                                   style: FilledButton.styleFrom(
+ 498|                                     padding: const EdgeInsets.symmetric(
+ 499|                                       vertical: 16,
+ 500|                                     ),
+ 501|                                   ),
+ 502|                                   onPressed: _startTracking,
+ 503|                                   icon: const Icon(Icons.play_arrow),
+ 504|                                   label: const Text('继续测速'),
+ 505|                                 ),
+ 506|                               ),
+ 507|                               const SizedBox(width: 12),
+ 508|                               Expanded(
+ 509|                                 child: OutlinedButton.icon(
+ 510|                                   style: OutlinedButton.styleFrom(
+ 511|                                     padding: const EdgeInsets.symmetric(
+ 512|                                       vertical: 16,
+ 513|                                     ),
+ 514|                                   ),
+ 515|                                   onPressed: _endTracking,
+ 516|                                   icon: const Icon(Icons.stop_circle),
+ 517|                                   label: const Text('结束测速'),
+ 518|                                 ),
+ 519|                               ),
+ 520|                             ],
+ 521|                           )
+ 522|                         else
+ 523|                           SizedBox(
+ 524|                             width: double.infinity,
+ 525|                             child: FilledButton.icon(
+ 526|                               style: FilledButton.styleFrom(
+ 527|                                 padding: const EdgeInsets.symmetric(
+ 528|                                   vertical: 16,
+ 529|                                 ),
+ 530|                               ),
+ 531|                               onPressed: _startTracking,
+ 532|                               icon: const Icon(Icons.play_arrow),
+ 533|                               label: const Text('开始测速'),
+ 534|                             ),
+ 535|                           ),
+ 536|                         const SizedBox(height: 8),
+ 537|                       ],
+ 538|                     ),
+ 539|                   ),
+ 540|                 ),
+ 541|               ),
+ 542|             );
+ 543|           },
+ 544|         ),
+ 545|       ),
+ 546|     );
+ 547|   }
+ 548| }
+ 549| 
+ 550| class SpeedGauge extends StatelessWidget {
+ 551|   const SpeedGauge({
+ 552|     super.key,
+ 553|     required this.speedKmh,
+ 554|     required this.maxSpeedKmh,
+ 555|   });
+ 556| 
+ 557|   final double speedKmh;
+ 558|   final double maxSpeedKmh;
+ 559| 
+ 560|   @override
+ 561|   Widget build(BuildContext context) {
+ 562|     final clampedSpeed = speedKmh.clamp(0.0, maxSpeedKmh);
+ 563| 
+ 564|     return LayoutBuilder(
+ 565|       builder: (context, constraints) {
+ 566|         // 在可用空间内等比缩放表盘，最大为 340x260，避免矮屏上被截断
+ 567|         final scale = math.min(
+ 568|           1.0,
+ 569|           math.min(
+ 570|             constraints.maxWidth / 340.0,
+ 571|             constraints.maxHeight / 260.0,
+ 572|           ),
+ 573|         );
+ 574|         final gaugeSize = Size(340 * scale, 260 * scale);
+ 575| 
+ 576|         return Center(
+ 577|           child: TweenAnimationBuilder<double>(
+ 578|             tween: Tween<double>(begin: 0, end: clampedSpeed),
+ 579|             duration: const Duration(milliseconds: 450),
+ 580|             curve: Curves.easeOutCubic,
+ 581|             builder: (context, animatedSpeed, _) {
+ 582|               return SizedBox(
+ 583|                 width: gaugeSize.width,
+ 584|                 height: gaugeSize.height,
+ 585|                 child: ClipRect(
+ 586|                   child: CustomPaint(
+ 587|                     size: gaugeSize,
+ 588|                     painter: _SpeedGaugePainter(
+ 589|                       speedKmh: animatedSpeed,
+ 590|                       maxSpeedKmh: maxSpeedKmh,
+ 591|                       colorScheme: Theme.of(context).colorScheme,
+ 592|                     ),
+ 593|                   ),
+ 594|                 ),
+ 595|               );
+ 596|             },
+ 597|           ),
+ 598|         );
+ 599|       },
+ 600|     );
+ 601|   }
+ 602| }
+ 603| 
+ 604| class _SpeedGaugePainter extends CustomPainter {
+ 605|   _SpeedGaugePainter({
+ 606|     required this.speedKmh,
+ 607|     required this.maxSpeedKmh,
+ 608|     required this.colorScheme,
+ 609|   });
+ 610| 
+ 611|   final double speedKmh;
+ 612|   final double maxSpeedKmh;
+ 613|   final ColorScheme colorScheme;
+ 614| 
+ 615|   static const double _startAngle = math.pi * 0.75;
+ 616|   static const double _sweepAngle = math.pi * 1.5;
+ 617| 
+ 618|   // 非线性刻度：0-160 km/h 展开（占 72% 的弧长），160-400 km/h 压缩（占 28%）
+ 619|   static const double _breakpointKmh = 160;
+ 620|   static const double _breakpointFraction = 0.72;
+ 621| 
+ 622|   /// 把速度 km/h 映射到表盘的弧长比例 [0, 1]
+ 623|   double _speedToFraction(double kmh) {
+ 624|     final s = kmh.clamp(0.0, maxSpeedKmh);
+ 625|     if (s <= _breakpointKmh) {
+ 626|       return (s / _breakpointKmh) * _breakpointFraction;
+ 627|     }
+ 628|     return _breakpointFraction +
+ 629|         ((s - _breakpointKmh) / (maxSpeedKmh - _breakpointKmh)) *
+ 630|             (1 - _breakpointFraction);
+ 631|   }
+ 632| 
+ 633|   @override
+ 634|   void paint(Canvas canvas, Size size) {
+ 635|     final center = Offset(size.width / 2, size.height * 0.58);
+ 636|     final radius = math.min(size.width / 2 - 20, size.height * 0.46);
+ 637| 
+ 638|     final arcRect = Rect.fromCircle(center: center, radius: radius);
+ 639|     final value = _speedToFraction(speedKmh);
+ 640|     final needleAngle = _startAngle + _sweepAngle * value;
+ 641| 
+ 642|     final baseArcPaint = Paint()
+ 643|       ..color = colorScheme.surfaceContainerHighest
+ 644|       ..style = PaintingStyle.stroke
+ 645|       ..strokeWidth = 16
+ 646|       ..strokeCap = StrokeCap.round;
+ 647| 
+ 648|     final activeArcPaint = Paint()
+ 649|       ..shader = SweepGradient(
+ 650|         startAngle: _startAngle,
+ 651|         endAngle: _startAngle + _sweepAngle,
+ 652|         colors: const [Color(0xFF2E7D32), Color(0xFFF9A825), Color(0xFFC62828)],
+ 653|       ).createShader(arcRect)
+ 654|       ..style = PaintingStyle.stroke
+ 655|       ..strokeWidth = 16
+ 656|       ..strokeCap = StrokeCap.round;
+ 657| 
+ 658|     canvas.drawArc(arcRect, _startAngle, _sweepAngle, false, baseArcPaint);
+ 659|     canvas.drawArc(
+ 660|       arcRect,
+ 661|       _startAngle,
+ 662|       _sweepAngle * value,
+ 663|       false,
+ 664|       activeArcPaint,
+ 665|     );
+ 666| 
+ 667|     final majorTickPaint = Paint()
+ 668|       ..color = colorScheme.onSurface.withValues(alpha: 0.7)
+ 669|       ..strokeWidth = 2.4
+ 670|       ..strokeCap = StrokeCap.round;
+ 671| 
+ 672|     final majorTickActivePaint = Paint()
+ 673|       ..color = colorScheme.onSurface
+ 674|       ..strokeWidth = 2.4
+ 675|       ..strokeCap = StrokeCap.round;
+ 676| 
+ 677|     final minorTickPaint = Paint()
+ 678|       ..color = colorScheme.onSurface.withValues(alpha: 0.38)
+ 679|       ..strokeWidth = 1.4
+ 680|       ..strokeCap = StrokeCap.round;
+ 681| 
+ 682|     // 主刻度：0-160 每 20 km/h（展开、刻度更细），160-400 稀疏（200/250/300/350/400）
+ 683|     const List<double> majorTickSpeeds = [
+ 684|       0, 20, 40, 60, 80, 100, 120, 140, 160, 200, 250, 300, 350, 400,
+ 685|     ];
+ 686|     // 次刻度：仅在 0-160 内，每 10 km/h（主刻度之间各一条）
+ 687|     const List<double> minorTickSpeeds = [10, 30, 50, 70, 90, 110, 130, 150];
+ 688| 
+ 689|     for (final tickSpeed in majorTickSpeeds) {
+ 690|       final t = _speedToFraction(tickSpeed);
+ 691|       final angle = _startAngle + _sweepAngle * t;
+ 692|       final isActiveTick = t <= value;
+ 693| 
+ 694|       final pOuter = _pointOnCircle(center, radius + 2, angle);
+ 695|       final pInner = _pointOnCircle(center, radius - 16, angle);
+ 696|       canvas.drawLine(
+ 697|         pOuter,
+ 698|         pInner,
+ 699|         isActiveTick ? majorTickActivePaint : majorTickPaint,
+ 700|       );
+ 701| 
+ 702|       final labelOffset = _pointOnCircle(center, radius - 34, angle);
+ 703|       _drawCenteredText(
+ 704|         canvas,
+ 705|         tickSpeed.round().toString(),
+ 706|         labelOffset,
+ 707|         TextStyle(
+ 708|           color: colorScheme.onSurface.withValues(alpha: 0.8),
+ 709|           fontSize: 11,
+ 710|           fontWeight: FontWeight.w600,
+ 711|         ),
+ 712|       );
+ 713|     }
+ 714| 
+ 715|     for (final tickSpeed in minorTickSpeeds) {
+ 716|       final t = _speedToFraction(tickSpeed);
+ 717|       final angle = _startAngle + _sweepAngle * t;
+ 718|       final subOuter = _pointOnCircle(center, radius + 1, angle);
+ 719|       final subInner = _pointOnCircle(center, radius - 9, angle);
+ 720|       canvas.drawLine(subOuter, subInner, minorTickPaint);
+ 721|     }
+ 722| 
+ 723|     final needleTail = _pointOnCircle(
+ 724|       center,
+ 725|       radius * 0.1,
+ 726|       needleAngle + math.pi,
+ 727|     );
+ 728|     final needleTip = _pointOnCircle(center, radius - 24, needleAngle);
+ 729|     final needlePaint = Paint()
+ 730|       ..color = colorScheme.primary
+ 731|       ..strokeWidth = 4
+ 732|       ..strokeCap = StrokeCap.round;
+ 733|     canvas.drawLine(needleTail, needleTip, needlePaint);
+ 734| 
+ 735|     final hubOuterPaint = Paint()..color = colorScheme.primary;
+ 736|     final hubInnerPaint = Paint()..color = colorScheme.onPrimary;
+ 737|     canvas.drawCircle(center, 9, hubOuterPaint);
+ 738|     canvas.drawCircle(center, 4.2, hubInnerPaint);
+ 739|   }
+ 740| 
+ 741|   Offset _pointOnCircle(Offset center, double radius, double angle) {
+ 742|     return Offset(
+ 743|       center.dx + radius * math.cos(angle),
+ 744|       center.dy + radius * math.sin(angle),
+ 745|     );
+ 746|   }
+ 747| 
+ 748|   void _drawCenteredText(
+ 749|     Canvas canvas,
+ 750|     String text,
+ 751|     Offset center,
+ 752|     TextStyle style,
+ 753|   ) {
+ 754|     final textPainter = TextPainter(
+ 755|       text: TextSpan(text: text, style: style),
+ 756|       textDirection: TextDirection.ltr,
+ 757|     )..layout();
+ 758|     final offset = Offset(
+ 759|       center.dx - textPainter.width / 2,
+ 760|       center.dy - textPainter.height / 2,
+ 761|     );
+ 762|     textPainter.paint(canvas, offset);
+ 763|   }
+ 764| 
+ 765|   @override
+ 766|   bool shouldRepaint(covariant _SpeedGaugePainter oldDelegate) {
+ 767|     return oldDelegate.speedKmh != speedKmh ||
+ 768|         oldDelegate.maxSpeedKmh != maxSpeedKmh ||
+ 769|         oldDelegate.colorScheme != colorScheme;
+ 770|   }
+ 771| }

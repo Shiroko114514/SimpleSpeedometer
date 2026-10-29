@@ -9,17 +9,53 @@ void main() {
   runApp(const SpeedometerApp());
 }
 
+/// 深色仪表盘配色：低亮度底色 + 青色强调色，减少夜间读数时的眩光。
+abstract final class _AppColors {
+  static const Color bgTop = Color(0xFF0A1017);
+  static const Color bgBottom = Color(0xFF14202F);
+  static const Color card = Color(0x14FFFFFF);
+  static const Color border = Color(0x1FFFFFFF);
+  static const Color textPrimary = Color(0xFFECF2FF);
+  static const Color textMuted = Color(0xFF8395B0);
+  static const Color accent = Color(0xFF31E1C4);
+  static const Color track = Color(0x1FFFFFFF);
+  static const Color arcLow = Color(0xFF31E1C4);
+  static const Color arcMid = Color(0xFFFFC857);
+  static const Color arcHigh = Color(0xFFFF5470);
+}
+
 class SpeedometerApp extends StatelessWidget {
   const SpeedometerApp({super.key});
 
   @override
   Widget build(BuildContext context) {
+    final base = ThemeData(
+      useMaterial3: true,
+      brightness: Brightness.dark,
+      colorScheme: ColorScheme.fromSeed(
+        seedColor: _AppColors.accent,
+        brightness: Brightness.dark,
+      ).copyWith(
+        primary: _AppColors.accent,
+        onPrimary: const Color(0xFF04211D),
+        surface: _AppColors.bgBottom,
+      ),
+    );
+
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'SimpleSpeedometer',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.teal),
-        useMaterial3: true,
+      theme: base.copyWith(
+        scaffoldBackgroundColor: _AppColors.bgTop,
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.transparent,
+          surfaceTintColor: Colors.transparent,
+          elevation: 0,
+        ),
+        textTheme: base.textTheme.apply(
+          bodyColor: _AppColors.textPrimary,
+          displayColor: _AppColors.textPrimary,
+        ),
       ),
       home: const SpeedometerPage(),
     );
@@ -35,6 +71,11 @@ class SpeedometerPage extends StatefulWidget {
 
 class _SpeedometerPageState extends State<SpeedometerPage> {
   static const double _maxSpeedKmh = 400;
+
+  /// 用位移推算速度时可接受的定位时间差范围（秒）。
+  /// 过小说明是重复/同批数据，过大说明中间断流，两种情况推算都不可信。
+  static const double _minDeriveSeconds = 0.1;
+  static const double _maxDeriveSeconds = 5.0;
 
   StreamSubscription<Position>? _positionSubscription;
   Timer? _ticker;
@@ -240,57 +281,88 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
     });
   }
 
+  /// 相邻两次定位之间的大圆距离（米）。
+  double _stepMeters(Position from, Position to) => Geolocator.distanceBetween(
+    from.latitude,
+    from.longitude,
+    to.latitude,
+    to.longitude,
+  );
+
+  /// 位移是否仍落在 GPS 噪声范围内。
+  ///
+  /// `accuracy` 是定位的 68% 置信半径；两次定位间的位移小于该半径时，无法与
+  /// 静止时的坐标抖动区分，因此既不能累加距离，也不能用来推算速度。
+  /// accuracy 缺失（<=0）时不做过滤，退回原有行为。
+  bool _isWithinNoise(Position from, Position to, double stepMeters) {
+    final noise = math.max(from.accuracy, to.accuracy);
+    return noise > 0 && stepMeters <= noise;
+  }
+
+  /// 当前速度（m/s）。
+  ///
+  /// 优先采用系统给出的 `speed`；当其为 0/NaN/负值（部分设备不提供该字段）时，
+  /// 用相邻两次定位的位移除以两次**定位时间戳**之差推算。
+  ///
+  /// 这里必须用 `position.timestamp` 而非数据到达时间：定位数据可能成批到达，
+  /// 到达时间差会趋近于 0，从而把速度放大到几千 km/h 的荒谬量级。
+  double _resolveSpeedMps(Position position) {
+    final reported = position.speed;
+    if (reported.isFinite && reported > 0) {
+      return reported;
+    }
+
+    final previous = _lastPosition;
+    final previousTime = _lastTimestamp;
+    if (previous == null || previousTime == null) {
+      return 0;
+    }
+
+    final dt = position.timestamp.difference(previousTime).inMilliseconds / 1000;
+    // 时间差过小（重复或同批数据）或过大（中间断流）时，推算没有意义
+    if (dt < _minDeriveSeconds || dt > _maxDeriveSeconds) {
+      return 0;
+    }
+
+    final step = _stepMeters(previous, position);
+    if (_isWithinNoise(previous, position, step)) {
+      return 0;
+    }
+    return step / dt;
+  }
+
   void _onPosition(Position position) {
     _lastPositionUpdate = DateTime.now();
 
     if (_isTracking) {
       final trackedPrev = _lastTrackedPosition;
       if (trackedPrev != null) {
-        _distanceMeters += Geolocator.distanceBetween(
-          trackedPrev.latitude,
-          trackedPrev.longitude,
-          position.latitude,
-          position.longitude,
-        );
+        final step = _stepMeters(trackedPrev, position);
+        // 静止时 GPS 坐标抖动会逐帧累加出虚假里程，进而抬高平均速度
+        if (!_isWithinNoise(trackedPrev, position, step)) {
+          _distanceMeters += step;
+        }
       }
       _lastTrackedPosition = position;
     }
 
-    double speedMps = position.speed;
-
-    if (speedMps.isNaN || speedMps.isNegative || speedMps == 0) {
-      final prev = _lastPosition;
-      final prevTime = _lastTimestamp;
-      if (prev != null && prevTime != null) {
-        final now = DateTime.now();
-        final dt = now.difference(prevTime).inMilliseconds / 1000;
-        if (dt > 0) {
-          final distance = Geolocator.distanceBetween(
-            prev.latitude,
-            prev.longitude,
-            position.latitude,
-            position.longitude,
-          );
-          speedMps = distance / dt;
-        }
-        _lastTimestamp = now;
-      } else {
-        _lastTimestamp = DateTime.now();
-      }
-    } else {
-      _lastTimestamp = DateTime.now();
-    }
+    final speedMps = _resolveSpeedMps(position);
 
     _lastPosition = position;
+    _lastTimestamp = position.timestamp;
 
     setState(() {
-      _speedMps = speedMps.clamp(0, 999);
+      // 钳制到表盘量程，避免读数超出表盘刻度的最大值
+      _speedMps = speedMps.clamp(0.0, _maxSpeedMps);
       _statusMessage = '测速中...';
       _isTracking = true;
     });
   }
 
   double get _speedKmh => _speedMps * 3.6;
+
+  /// 表盘量程对应的 m/s 上限，用于钳制速度读数
+  double get _maxSpeedMps => _maxSpeedKmh / 3.6;
 
   Duration get _elapsed => _stopwatch.elapsed;
 
@@ -316,20 +388,274 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
     return '${meters.toStringAsFixed(0)} m';
   }
 
-  Widget _metricRow(BuildContext context, String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 4),
+  // 注意：ButtonStyle.textStyle 会整体替换主题文字样式而非合并，
+  // 因此必须显式基于主题样式派生，否则会丢失主题字体族。
+  TextStyle _buttonTextStyle(
+    BuildContext context, {
+    required FontWeight weight,
+  }) {
+    final base = Theme.of(context).textTheme.labelLarge ?? const TextStyle();
+    return base.copyWith(
+      fontSize: 15,
+      fontWeight: weight,
+      letterSpacing: 0.6,
+    );
+  }
+
+  ButtonStyle _primaryButtonStyle(BuildContext context) =>
+      FilledButton.styleFrom(
+        backgroundColor: _AppColors.accent,
+        foregroundColor: const Color(0xFF04211D),
+        minimumSize: const Size(0, 52),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        textStyle: _buttonTextStyle(context, weight: FontWeight.w700),
+      );
+
+  ButtonStyle _secondaryButtonStyle(BuildContext context) =>
+      OutlinedButton.styleFrom(
+        foregroundColor: _AppColors.textPrimary,
+        backgroundColor: _AppColors.card,
+        side: const BorderSide(color: _AppColors.border),
+        minimumSize: const Size(0, 52),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        textStyle: _buttonTextStyle(context, weight: FontWeight.w600),
+      );
+
+  Widget _card({required Widget child, required EdgeInsets padding}) {
+    return Container(
+      width: double.infinity,
+      padding: padding,
+      decoration: BoxDecoration(
+        color: _AppColors.card,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: _AppColors.border),
+      ),
+      child: child,
+    );
+  }
+
+  Widget _stat(String label, String value) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Text(
+            value,
+            maxLines: 1,
+            style: const TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+              color: _AppColors.textPrimary,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 11,
+            letterSpacing: 1.2,
+            color: _AppColors.textMuted,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _statsCard() {
+    return _card(
+      padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 8),
       child: Row(
         children: [
-          Text(label, style: Theme.of(context).textTheme.bodyMedium),
-          const Spacer(),
-          Text(
-            value,
-            style: Theme.of(
-              context,
-            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+          Expanded(child: _stat('时间', _formatDuration(_elapsed))),
+          const _StatDivider(),
+          Expanded(child: _stat('距离', _formatDistance(_distanceMeters))),
+          const _StatDivider(),
+          Expanded(
+            child: _stat(
+              '平均速度',
+              '${_averageSpeedKmh.toStringAsFixed(1)} km/h',
+            ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _statusPill() {
+    final Color color = _isTracking
+        ? _AppColors.accent
+        : (_hasSession ? _AppColors.arcMid : _AppColors.textMuted);
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: color.withValues(alpha: 0.30)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 7,
+            height: 7,
+            decoration: BoxDecoration(
+              color: color,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(color: color.withValues(alpha: 0.9), blurRadius: 9),
+              ],
+            ),
+          ),
+          const SizedBox(width: 9),
+          Flexible(
+            child: Text(
+              _statusMessage,
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: _AppColors.textPrimary,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _coordinates() {
+    final position = _lastPosition;
+    final lat = position?.latitude.toStringAsFixed(6) ?? '-';
+    final lng = position?.longitude.toStringAsFixed(6) ?? '-';
+
+    return Text(
+      'LAT $lat   LNG $lng',
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: const TextStyle(
+        fontSize: 11,
+        letterSpacing: 0.6,
+        color: _AppColors.textMuted,
+        fontFeatures: [FontFeature.tabularFigures()],
+      ),
+    );
+  }
+
+  Widget _speedReadout(double speedKmh) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // FittedBox 兜底：极窄屏或超大系统字号下把读数整体等比缩小，避免溢出
+        FittedBox(
+          fit: BoxFit.scaleDown,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.baseline,
+            textBaseline: TextBaseline.alphabetic,
+            children: [
+              Text(
+                speedKmh.toStringAsFixed(1),
+                style: const TextStyle(
+                  fontSize: 52,
+                  height: 1.05,
+                  fontWeight: FontWeight.w300,
+                  letterSpacing: -1.0,
+                  color: _AppColors.textPrimary,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                ),
+              ),
+              const SizedBox(width: 8),
+              const Text(
+                'km/h',
+                style: TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 1.0,
+                  color: _AppColors.textMuted,
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 2),
+        const Text(
+          '实时速度',
+          style: TextStyle(
+            fontSize: 11,
+            letterSpacing: 3.0,
+            color: _AppColors.textMuted,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _controls(BuildContext context) {
+    if (_isTracking) {
+      return SizedBox(
+        width: double.infinity,
+        child: Row(
+          children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                style: _secondaryButtonStyle(context),
+                onPressed: _pauseTracking,
+                icon: const Icon(Icons.pause_rounded, size: 20),
+                label: const Text('暂停测速'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: FilledButton.icon(
+                style: _primaryButtonStyle(context),
+                onPressed: _endTracking,
+                icon: const Icon(Icons.stop_rounded, size: 20),
+                label: const Text('结束测速'),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    if (_hasSession) {
+      return SizedBox(
+        width: double.infinity,
+        child: Row(
+          children: [
+            Expanded(
+              child: FilledButton.icon(
+                style: _primaryButtonStyle(context),
+                onPressed: _startTracking,
+                icon: const Icon(Icons.play_arrow_rounded, size: 20),
+                label: const Text('继续测速'),
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: OutlinedButton.icon(
+                style: _secondaryButtonStyle(context),
+                onPressed: _endTracking,
+                icon: const Icon(Icons.stop_rounded, size: 20),
+                label: const Text('结束测速'),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return SizedBox(
+      width: double.infinity,
+      child: FilledButton.icon(
+        style: _primaryButtonStyle(context),
+        onPressed: _startTracking,
+        icon: const Icon(Icons.play_arrow_rounded, size: 20),
+        label: const Text('开始测速'),
       ),
     );
   }
@@ -337,212 +663,97 @@ class _SpeedometerPageState extends State<SpeedometerPage> {
   @override
   Widget build(BuildContext context) {
     final speedKmh = _speedKmh;
-    final colorScheme = Theme.of(context).colorScheme;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('SimpleSpeedometer')),
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
-            final contentWidth = math.min(constraints.maxWidth, 420.0);
-            final viewportHeight = constraints.maxHeight;
+      backgroundColor: _AppColors.bgTop,
+      appBar: AppBar(
+        centerTitle: true,
+        title: const Text(
+          'SimpleSpeedometer',
+          style: TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 2.8,
+            color: _AppColors.textMuted,
+          ),
+        ),
+      ),
+      body: DecoratedBox(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [_AppColors.bgTop, _AppColors.bgBottom],
+          ),
+        ),
+        child: SafeArea(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final contentWidth = math.min(constraints.maxWidth, 420.0);
+              final viewportHeight = constraints.maxHeight;
 
-            // 表盘以外全部内容（速度数值/标签/统计/状态/坐标/按钮及间距）的
-            // 估算高度，用于在矮屏上压缩表盘高度，优先保证按钮一屏可见。
-            const double fixedContentHeight = 330.0;
-            const double gaugeBlockMinHeight = 200.0;
-            final gaugeBlockHeight = math.max(
-              gaugeBlockMinHeight,
-              viewportHeight - fixedContentHeight,
-            );
+              // 表盘以外内容（读数/统计/状态/坐标/按钮及间距）的估算高度，
+              // 用于在矮屏上优先压缩表盘，保证功能按钮一屏可见；高屏上限制上限，
+              // 避免表盘被拉伸后四周留白过多。
+              const double fixedContentHeight = 300.0;
+              const double gaugeBlockMinHeight = 168.0;
+              const double gaugeBlockMaxHeight = 340.0;
+              final gaugeBlockHeight = (viewportHeight - fixedContentHeight)
+                  .clamp(gaugeBlockMinHeight, gaugeBlockMaxHeight);
 
-            return SingleChildScrollView(
-              child: Center(
-                child: ConstrainedBox(
-                  constraints: BoxConstraints(
-                    maxWidth: contentWidth,
-                    minHeight: math.max(0, viewportHeight - 24),
-                  ),
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        SizedBox(
-                          height: gaugeBlockHeight,
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Expanded(
-                                child: SpeedGauge(
-                                  speedKmh: speedKmh,
-                                  maxSpeedKmh: _maxSpeedKmh,
-                                ),
-                              ),
-                              const SizedBox(height: 6),
-                              Text(
-                                speedKmh.toStringAsFixed(1),
-                                style: Theme.of(context).textTheme.displayMedium
-                                    ?.copyWith(fontWeight: FontWeight.w700),
-                              ),
-                              Text(
-                                '实时速度 (km/h)',
-                                style: Theme.of(context).textTheme.titleMedium,
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 10),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
-                          ),
-                          decoration: BoxDecoration(
-                            color: colorScheme.surfaceContainerLow,
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: Column(
-                            children: [
-                              _metricRow(
-                                context,
-                                '时间',
-                                _formatDuration(_elapsed),
-                              ),
-                              _metricRow(
-                                context,
-                                '距离',
-                                _formatDistance(_distanceMeters),
-                              ),
-                              _metricRow(
-                                context,
-                                '平均速度',
-                                '${_averageSpeedKmh.toStringAsFixed(1)} km/h',
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 10,
-                          ),
-                          decoration: BoxDecoration(
-                            color: colorScheme.surfaceContainerLow,
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: Text(
-                            _statusMessage,
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodyLarge,
-                          ),
-                        ),
-                        const SizedBox(height: 8),
-                        Container(
-                          width: double.infinity,
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 10,
-                          ),
-                          decoration: BoxDecoration(
-                            color: colorScheme.surfaceContainerLow,
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          child: Text(
-                            'Lat: ${_lastPosition?.latitude.toStringAsFixed(6) ?? '-'}  '
-                            'Lng: ${_lastPosition?.longitude.toStringAsFixed(6) ?? '-'}',
-                            textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodyMedium,
-                          ),
-                        ),
-                        const SizedBox(height: 12),
-                        if (_isTracking)
-                          Row(
-                            children: [
-                              Expanded(
-                                child: OutlinedButton.icon(
-                                  style: OutlinedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 16,
-                                    ),
-                                  ),
-                                  onPressed: _pauseTracking,
-                                  icon: const Icon(Icons.pause_circle),
-                                  label: const Text('暂停测速'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: FilledButton.icon(
-                                  style: FilledButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 16,
-                                    ),
-                                  ),
-                                  onPressed: _endTracking,
-                                  icon: const Icon(Icons.stop_circle),
-                                  label: const Text('结束测速'),
-                                ),
-                              ),
-                            ],
-                          )
-                        else if (_hasSession)
-                          Row(
-                            children: [
-                              Expanded(
-                                child: FilledButton.icon(
-                                  style: FilledButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 16,
-                                    ),
-                                  ),
-                                  onPressed: _startTracking,
-                                  icon: const Icon(Icons.play_arrow),
-                                  label: const Text('继续测速'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: OutlinedButton.icon(
-                                  style: OutlinedButton.styleFrom(
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 16,
-                                    ),
-                                  ),
-                                  onPressed: _endTracking,
-                                  icon: const Icon(Icons.stop_circle),
-                                  label: const Text('结束测速'),
-                                ),
-                              ),
-                            ],
-                          )
-                        else
+              return SingleChildScrollView(
+                child: Center(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: contentWidth,
+                      minHeight: math.max(0, viewportHeight - 16),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(18, 0, 18, 10),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
                           SizedBox(
-                            width: double.infinity,
-                            child: FilledButton.icon(
-                              style: FilledButton.styleFrom(
-                                padding: const EdgeInsets.symmetric(
-                                  vertical: 16,
-                                ),
-                              ),
-                              onPressed: _startTracking,
-                              icon: const Icon(Icons.play_arrow),
-                              label: const Text('开始测速'),
+                            height: gaugeBlockHeight,
+                            child: SpeedGauge(
+                              speedKmh: speedKmh,
+                              maxSpeedKmh: _maxSpeedKmh,
                             ),
                           ),
-                        const SizedBox(height: 8),
-                      ],
+                          _speedReadout(speedKmh),
+                          const SizedBox(height: 14),
+                          _statsCard(),
+                          const SizedBox(height: 12),
+                          _statusPill(),
+                          const SizedBox(height: 8),
+                          _coordinates(),
+                          const SizedBox(height: 14),
+                          _controls(context),
+                          const SizedBox(height: 6),
+                        ],
+                      ),
                     ),
                   ),
                 ),
-              ),
-            );
-          },
+              );
+            },
+          ),
         ),
       ),
+    );
+  }
+}
+
+class _StatDivider extends StatelessWidget {
+  const _StatDivider();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 1,
+      height: 28,
+      margin: const EdgeInsets.symmetric(horizontal: 4),
+      color: _AppColors.border,
     );
   }
 }
@@ -563,15 +774,15 @@ class SpeedGauge extends StatelessWidget {
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        // 在可用空间内等比缩放表盘，最大为 340x260，避免矮屏上被截断
-        final scale = math.min(
-          1.0,
-          math.min(
-            constraints.maxWidth / 340.0,
-            constraints.maxHeight / 260.0,
-          ),
-        );
-        final gaugeSize = Size(340 * scale, 260 * scale);
+        // 直接把可用空间交给画笔：表盘的宽高限制由 _SpeedGaugePainter 内部
+        // 按弧形真实比例求解，避免固定宽高比盒子里出现成片无效留白。
+        final maxWidth = constraints.hasBoundedWidth
+            ? constraints.maxWidth
+            : 340.0;
+        final maxHeight = constraints.hasBoundedHeight
+            ? constraints.maxHeight
+            : 260.0;
+        final gaugeSize = Size(maxWidth, maxHeight);
 
         return Center(
           child: TweenAnimationBuilder<double>(
@@ -588,7 +799,7 @@ class SpeedGauge extends StatelessWidget {
                     painter: _SpeedGaugePainter(
                       speedKmh: animatedSpeed,
                       maxSpeedKmh: maxSpeedKmh,
-                      colorScheme: Theme.of(context).colorScheme,
+                      fontFamily: DefaultTextStyle.of(context).style.fontFamily,
                     ),
                   ),
                 ),
@@ -605,12 +816,14 @@ class _SpeedGaugePainter extends CustomPainter {
   _SpeedGaugePainter({
     required this.speedKmh,
     required this.maxSpeedKmh,
-    required this.colorScheme,
+    this.fontFamily,
   });
 
   final double speedKmh;
   final double maxSpeedKmh;
-  final ColorScheme colorScheme;
+
+  /// 刻度文字字体，取主题字体以保证与界面其余文字一致
+  final String? fontFamily;
 
   static const double _startAngle = math.pi * 0.75;
   static const double _sweepAngle = math.pi * 1.5;
@@ -632,110 +845,150 @@ class _SpeedGaugePainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height * 0.58);
-    final radius = math.min(size.width / 2 - 20, size.height * 0.46);
+    // 表盘纵向占用 1.707r（顶端指针刻度到两端弧口的距离）加描边与外发光留白。
+    final radius = math.min(
+      size.width / 2 - 26,
+      math.max(0.0, (size.height - 44) / 1.707),
+    );
+    final center = Offset(size.width / 2, radius + 22);
 
     final arcRect = Rect.fromCircle(center: center, radius: radius);
     final value = _speedToFraction(speedKmh);
     final needleAngle = _startAngle + _sweepAngle * value;
 
-    final baseArcPaint = Paint()
-      ..color = colorScheme.surfaceContainerHighest
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 16
-      ..strokeCap = StrokeCap.round;
-
-    final activeArcPaint = Paint()
-      ..shader = SweepGradient(
-        startAngle: _startAngle,
-        endAngle: _startAngle + _sweepAngle,
-        colors: const [Color(0xFF2E7D32), Color(0xFFF9A825), Color(0xFFC62828)],
-      ).createShader(arcRect)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 16
-      ..strokeCap = StrokeCap.round;
-
-    canvas.drawArc(arcRect, _startAngle, _sweepAngle, false, baseArcPaint);
+    // 轨道弧
     canvas.drawArc(
       arcRect,
       _startAngle,
-      _sweepAngle * value,
+      _sweepAngle,
       false,
-      activeArcPaint,
+      Paint()
+        ..color = _AppColors.track
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 18
+        ..strokeCap = StrokeCap.round,
     );
 
-    final majorTickPaint = Paint()
-      ..color = colorScheme.onSurface.withValues(alpha: 0.7)
-      ..strokeWidth = 2.4
-      ..strokeCap = StrokeCap.round;
+    // 进度弧：渐变 + 外发光
+    if (value > 0.004) {
+      final gradient = const SweepGradient(
+        startAngle: _startAngle,
+        endAngle: _startAngle + _sweepAngle,
+        colors: [_AppColors.arcLow, _AppColors.arcMid, _AppColors.arcHigh],
+        stops: [0.0, 0.62, 1.0],
+      ).createShader(arcRect);
 
-    final majorTickActivePaint = Paint()
-      ..color = colorScheme.onSurface
-      ..strokeWidth = 2.4
-      ..strokeCap = StrokeCap.round;
+      final arcPaint = Paint()
+        ..shader = gradient
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 18
+        ..strokeCap = StrokeCap.round;
 
-    final minorTickPaint = Paint()
-      ..color = colorScheme.onSurface.withValues(alpha: 0.38)
-      ..strokeWidth = 1.4
-      ..strokeCap = StrokeCap.round;
+      canvas.drawArc(
+        arcRect,
+        _startAngle,
+        _sweepAngle * value,
+        false,
+        Paint()
+          ..shader = gradient
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 18
+          ..strokeCap = StrokeCap.round
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12),
+      );
+      canvas.drawArc(arcRect, _startAngle, _sweepAngle * value, false, arcPaint);
+    }
 
-    // 主刻度：0-160 每 20 km/h（展开、刻度更细），160-400 稀疏（200/250/300/350/400）
+    // 主刻度：0-160 每 20 km/h（展开、刻度更密），160-400 稀疏
     const List<double> majorTickSpeeds = [
       0, 20, 40, 60, 80, 100, 120, 140, 160, 200, 250, 300, 350, 400,
     ];
-    // 次刻度：仅在 0-160 内，每 10 km/h（主刻度之间各一条）
+    // 次刻度：仅在 0-160 内，每 10 km/h
     const List<double> minorTickSpeeds = [10, 30, 50, 70, 90, 110, 130, 150];
+
+    final minorTickPaint = Paint()
+      ..color = const Color(0x2EFFFFFF)
+      ..strokeWidth = 1.4
+      ..strokeCap = StrokeCap.round;
+
+    // 刻度全部画在弧带内侧：弧带占 radius±9，因此刻度从 radius-11 起向内延伸，
+    // 避免刻度压在彩色进度弧上形成"划痕"。
+    for (final tickSpeed in minorTickSpeeds) {
+      final angle = _startAngle + _sweepAngle * _speedToFraction(tickSpeed);
+      canvas.drawLine(
+        _pointOnCircle(center, radius - 11, angle),
+        _pointOnCircle(center, radius - 19, angle),
+        minorTickPaint,
+      );
+    }
 
     for (final tickSpeed in majorTickSpeeds) {
       final t = _speedToFraction(tickSpeed);
       final angle = _startAngle + _sweepAngle * t;
-      final isActiveTick = t <= value;
+      final isActive = t <= value;
 
-      final pOuter = _pointOnCircle(center, radius + 2, angle);
-      final pInner = _pointOnCircle(center, radius - 16, angle);
       canvas.drawLine(
-        pOuter,
-        pInner,
-        isActiveTick ? majorTickActivePaint : majorTickPaint,
+        _pointOnCircle(center, radius - 11, angle),
+        _pointOnCircle(center, radius - 26, angle),
+        Paint()
+          ..color = isActive
+              ? _AppColors.textPrimary
+              : const Color(0x59FFFFFF)
+          ..strokeWidth = 2.4
+          ..strokeCap = StrokeCap.round,
       );
 
-      final labelOffset = _pointOnCircle(center, radius - 34, angle);
       _drawCenteredText(
         canvas,
         tickSpeed.round().toString(),
-        labelOffset,
+        _pointOnCircle(center, radius - 39, angle),
         TextStyle(
-          color: colorScheme.onSurface.withValues(alpha: 0.8),
-          fontSize: 11,
+          color: isActive ? _AppColors.textPrimary : _AppColors.textMuted,
+          fontSize: 10.5,
           fontWeight: FontWeight.w600,
+          fontFamily: fontFamily,
+          fontFeatures: const [FontFeature.tabularFigures()],
         ),
       );
     }
 
-    for (final tickSpeed in minorTickSpeeds) {
-      final t = _speedToFraction(tickSpeed);
-      final angle = _startAngle + _sweepAngle * t;
-      final subOuter = _pointOnCircle(center, radius + 1, angle);
-      final subInner = _pointOnCircle(center, radius - 9, angle);
-      canvas.drawLine(subOuter, subInner, minorTickPaint);
-    }
+    // 指针：从中心轴射出的等腰三角形，根部完全藏在中心轴之下。
+    // 不再额外绘制配重尾针——细长的尾针在 11px 轴心外会露出单边尖刺。
+    final normal = Offset(-math.sin(needleAngle), math.cos(needleAngle));
+    final tip = _pointOnCircle(center, radius - 26, needleAngle);
+    const double baseHalfWidth = 5.0;
 
-    final needleTail = _pointOnCircle(
-      center,
-      radius * 0.1,
-      needleAngle + math.pi,
+    final needlePath = Path()
+      ..moveTo(tip.dx, tip.dy)
+      ..lineTo(
+        center.dx + normal.dx * baseHalfWidth,
+        center.dy + normal.dy * baseHalfWidth,
+      )
+      ..lineTo(
+        center.dx - normal.dx * baseHalfWidth,
+        center.dy - normal.dy * baseHalfWidth,
+      )
+      ..close();
+
+    canvas.drawPath(
+      needlePath,
+      Paint()
+        ..color = _AppColors.accent
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
     );
-    final needleTip = _pointOnCircle(center, radius - 24, needleAngle);
-    final needlePaint = Paint()
-      ..color = colorScheme.primary
-      ..strokeWidth = 4
-      ..strokeCap = StrokeCap.round;
-    canvas.drawLine(needleTail, needleTip, needlePaint);
+    canvas.drawPath(needlePath, Paint()..color = _AppColors.accent);
 
-    final hubOuterPaint = Paint()..color = colorScheme.primary;
-    final hubInnerPaint = Paint()..color = colorScheme.onPrimary;
-    canvas.drawCircle(center, 9, hubOuterPaint);
-    canvas.drawCircle(center, 4.2, hubInnerPaint);
+    // 中心轴
+    canvas.drawCircle(center, 11, Paint()..color = _AppColors.bgBottom);
+    canvas.drawCircle(
+      center,
+      11,
+      Paint()
+        ..color = _AppColors.accent.withValues(alpha: 0.45)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
+    canvas.drawCircle(center, 4.2, Paint()..color = _AppColors.textPrimary);
   }
 
   Offset _pointOnCircle(Offset center, double radius, double angle) {
@@ -766,6 +1019,6 @@ class _SpeedGaugePainter extends CustomPainter {
   bool shouldRepaint(covariant _SpeedGaugePainter oldDelegate) {
     return oldDelegate.speedKmh != speedKmh ||
         oldDelegate.maxSpeedKmh != maxSpeedKmh ||
-        oldDelegate.colorScheme != colorScheme;
+        oldDelegate.fontFamily != fontFamily;
   }
 }
